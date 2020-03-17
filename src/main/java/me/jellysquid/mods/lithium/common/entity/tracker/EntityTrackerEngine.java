@@ -5,10 +5,12 @@ import it.unimi.dsi.fastutil.objects.Reference2ReferenceOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import me.jellysquid.mods.lithium.common.entity.tracker.nearby.NearbyEntityListener;
 import me.jellysquid.mods.lithium.common.entity.tracker.nearby.NearbyEntityListenerProvider;
-import net.minecraft.entity.LivingEntity;
+import me.jellysquid.mods.lithium.common.entity.tracker.nearby.ExactPositionListener;
+import net.minecraft.entity.Entity;
 import net.minecraft.util.math.BlockBox;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkSectionPos;
+import net.minecraft.util.math.MathHelper;
 
 import java.util.*;
 
@@ -30,7 +32,7 @@ public class EntityTrackerEngine {
     /**
      * Called when an entity is added to the world.
      */
-    public void onEntityAdded(int x, int y, int z, LivingEntity entity) {
+    public void onEntityAdded(int x, int y, int z, Entity entity) {
         if (this.addEntity(x, y, z, entity)) {
             if (entity instanceof NearbyEntityListenerProvider) {
                 this.addListener(x, y, z, ((NearbyEntityListenerProvider) entity).getListener());
@@ -39,9 +41,35 @@ public class EntityTrackerEngine {
     }
 
     /**
+     * Called before an entity was teleported.
+     * Makes ExactPositionListeners possible.
+     * @author 2No2Name
+     */
+    public void beforeEntityTeleport(Entity entity) {
+        int x = MathHelper.floor(entity.getX()) >> 4;
+        int y = MathHelper.floor(entity.getY()) >> 4;
+        int z = MathHelper.floor(entity.getZ()) >> 4;
+
+        this.removeEntity(x, y, z, entity);
+    }
+
+    /**
+     * Called after an entity was teleported.
+     * Makes ExactPositionListeners possible.
+     * @author 2No2Name
+     */
+    public void afterEntityTeleport(Entity entity) {
+        int x = MathHelper.floor(entity.getX()) >> 4;
+        int y = MathHelper.floor(entity.getY()) >> 4;
+        int z = MathHelper.floor(entity.getZ()) >> 4;
+
+        this.addEntity(x, y, z, entity);
+    }
+
+    /**
      * Called when an entity is removed from the world.
      */
-    public void onEntityRemoved(int x, int y, int z, LivingEntity entity) {
+    public void onEntityRemoved(int x, int y, int z, Entity entity) {
         if (this.removeEntity(x, y, z, entity)) {
             if (entity instanceof NearbyEntityListenerProvider) {
                 this.removeListener(((NearbyEntityListenerProvider) entity).getListener());
@@ -53,7 +81,7 @@ public class EntityTrackerEngine {
      * Called when an entity moves between chunks within a world. This is less expensive to call than manually
      * removing/adding an entity from chunks each time it moves.
      */
-    public void onEntityMoved(int aX, int aY, int aZ, int bX, int bY, int bZ, LivingEntity entity) {
+    public void onEntityMoved(int aX, int aY, int aZ, int bX, int bY, int bZ, Entity entity) {
         if (this.removeEntity(aX, aY, aZ, entity) && this.addEntity(bX, bY, bZ, entity)) {
             if (entity instanceof NearbyEntityListenerProvider) {
                 this.moveListener(aX, aY, aZ, bX, bY, bZ, ((NearbyEntityListenerProvider) entity).getListener());
@@ -61,11 +89,30 @@ public class EntityTrackerEngine {
         }
     }
 
-    private boolean addEntity(int x, int y, int z, LivingEntity entity) {
+    /**
+     * Called when an entity moves within a world, even when not changing chunk sections.
+     * This allows for tracking areas that are smaller than chunk sections precisely.
+     * This method cannot be used as a replacement for the methods that handle entering and leaving chunk sections.
+     *
+     * Note: only listeners that listen to the chunk section the entity is registered at are notified, even
+     * when the entity was just moved to another chunk section. This is intended to allow listeners to behave
+     * exactly like vanilla getting entities works. E.g. hoppers only look at chunk sections two blocks around
+     * their interaction area, and then check if the entities from those sections intersect with the area
+     * @param entity the entity that moved or was moved
+     * @author 2No2Name
+     */
+    public void onEntityMovedAnyDistance(Entity entity) {
+        TrackedEntityList chunkSectionList = this.getList(entity.chunkX, entity.chunkY, entity.chunkZ);
+        if (chunkSectionList != null) {
+            chunkSectionList.onEntityMovedAnyDistance(entity);
+        }
+    }
+
+    private boolean addEntity(int x, int y, int z, Entity entity) {
         return this.getOrCreateList(x, y, z).addTrackedEntity(entity);
     }
 
-    private boolean removeEntity(int x, int y, int z, LivingEntity entity) {
+    private boolean removeEntity(int x, int y, int z, Entity entity) {
         TrackedEntityList list = this.getList(x, y, z);
 
         if (list == null) {
@@ -75,7 +122,7 @@ public class EntityTrackerEngine {
         return list.removeTrackedEntity(entity);
     }
 
-    private void addListener(int x, int y, int z, NearbyEntityListener listener) {
+    public void addListener(int x, int y, int z, NearbyEntityListener listener) {
         int r = listener.getChunkRange();
 
         if (r == 0) {
@@ -104,9 +151,30 @@ public class EntityTrackerEngine {
         }
 
         this.sectionsByEntity.put(listener, all);
+        listener.onInitialEntitiesReceived();
     }
 
-    private void removeListener(NearbyEntityListener listener) {
+    public void addListener(int[] x, int[] y, int[] z, NearbyEntityListener listener) {
+        assert x.length == y.length && y.length == z.length;
+
+        if (this.sectionsByEntity.containsKey(listener)) {
+            throw new IllegalStateException("Adding Entity listener a second time: " + listener.toString());
+        }
+
+        List<TrackedEntityList> all = new ArrayList<>(x.length);
+        
+        for (int i = 0; i < x.length; i++) {
+            TrackedEntityList list = this.getOrCreateList(x[i], y[i], z[i]);
+            list.addListener(listener);
+
+            all.add(list);
+        }
+        
+        this.sectionsByEntity.put(listener, all);
+        listener.onInitialEntitiesReceived();
+    }
+    
+    public void removeListener(NearbyEntityListener listener) {
         int r = listener.getChunkRange();
 
         if (r == 0) {
@@ -189,9 +257,10 @@ public class EntityTrackerEngine {
     }
 
     private class TrackedEntityList {
-        private final Set<LivingEntity> entities = new ReferenceOpenHashSet<>();
+        private final Set<Entity> entities = new ReferenceOpenHashSet<>();
         private final Set<NearbyEntityListener> listeners = new ReferenceOpenHashSet<>();
-
+        private final Set<ExactPositionListener> exactPositionListeners = new ReferenceOpenHashSet<>();
+                
         private final long key;
 
         private TrackedEntityList(long key) {
@@ -199,24 +268,37 @@ public class EntityTrackerEngine {
         }
 
         public void addListener(NearbyEntityListener listener) {
-            for (LivingEntity entity : this.entities) {
+            for (Entity entity : this.entities) {
                 listener.onEntityEnteredRange(entity);
             }
 
             this.listeners.add(listener);
+            if (listener instanceof ExactPositionListener) {
+                this.exactPositionListeners.add((ExactPositionListener) listener);
+            }
         }
 
         public void removeListener(NearbyEntityListener listener) {
             if (this.listeners.remove(listener)) {
-                for (LivingEntity entity : this.entities) {
+                for (Entity entity : this.entities) {
                     listener.onEntityLeftRange(entity);
+                }
+                if (listener instanceof ExactPositionListener) {
+                    this.exactPositionListeners.remove(listener);
                 }
 
                 this.checkEmpty();
             }
         }
 
-        public boolean addTrackedEntity(LivingEntity entity) {
+        public void onEntityMovedAnyDistance(Entity entity) {
+            if (this.exactPositionListeners.isEmpty()) return;
+            for (ExactPositionListener listener : this.exactPositionListeners) {
+                listener.onEntityMovedAnyDistance(entity);
+            }
+        }
+        
+        public boolean addTrackedEntity(Entity entity) {
             for (NearbyEntityListener listener : this.listeners) {
                 listener.onEntityEnteredRange(entity);
             }
@@ -224,7 +306,7 @@ public class EntityTrackerEngine {
             return this.entities.add(entity);
         }
 
-        public boolean removeTrackedEntity(LivingEntity entity) {
+        public boolean removeTrackedEntity(Entity entity) {
             boolean ret = this.entities.remove(entity);
 
             if (ret) {
